@@ -5,6 +5,9 @@
 외부 라이브러리 없이 표준 라이브러리만 사용한다.
 """
 
+import json
+import os
+import sys
 import time
 
 # ---------------------------------------------------------------------------
@@ -227,10 +230,182 @@ def run_user_mode():
 
 
 # ---------------------------------------------------------------------------
-# 모드 2: data.json 분석 (3단계에서 구현)
+# 모드 2: data.json 분석
 # ---------------------------------------------------------------------------
-def run_json_mode():
-    print("data.json 분석 모드는 다음 단계에서 구현 예정입니다.")
+DEFAULT_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
+
+
+def parse_size_key(key, with_index=False):
+    """'size_{N}' 또는 'size_{N}_{idx}' 형태의 키에서 N을 꺼낸다.
+
+    형식이 맞지 않으면 None을 반환한다.
+    """
+    if not isinstance(key, str):
+        return None
+    parts = key.split("_")
+    expected_len = 3 if with_index else 2
+    if len(parts) != expected_len or parts[0] != "size":
+        return None
+    if not all(p.isdigit() for p in parts[1:]):
+        return None
+    n = int(parts[1])
+    return n if n > 0 else None
+
+
+def load_json(path):
+    """JSON 파일을 읽는다. 성공하면 (데이터, None), 실패하면 (None, 오류 메시지)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f), None
+    except FileNotFoundError:
+        return None, "파일을 찾을 수 없음: {}".format(path)
+    except json.JSONDecodeError as e:
+        return None, "JSON 형식 오류: {}".format(e)
+
+
+def load_filters(data):
+    """data['filters']를 읽어 {N: {'Cross': 배열, 'X': 배열}} 형태로 반환한다.
+
+    필터 키('cross', 'x')는 표준 라벨로 정규화한다.
+    문제가 있는 크기는 건너뛰고 이유를 출력한다. (해당 크기 패턴은 나중에 FAIL 처리)
+    """
+    filters = {}
+    raw_filters = data.get("filters") if isinstance(data, dict) else None
+    if not isinstance(raw_filters, dict):
+        print("✗ filters 항목이 없거나 형식이 잘못됨")
+        return filters
+
+    for size_key, group in raw_filters.items():
+        n = parse_size_key(size_key)
+        if n is None:
+            print("✗ {:<8} 키 형식 오류 (size_N 형태가 아님)".format(size_key))
+            continue
+        if not isinstance(group, dict):
+            print("✗ {:<8} 필터 묶음 형식 오류".format(size_key))
+            continue
+
+        loaded = {}
+        error = None
+        for raw_label, matrix in group.items():
+            label = normalize_label(raw_label)
+            if label is None:
+                error = "알 수 없는 필터 라벨: {!r}".format(raw_label)
+                break
+            problem = validate_matrix(matrix, n)
+            if problem:
+                error = "{} 필터 {}".format(label, problem)
+                break
+            loaded[label] = matrix
+
+        if error is None:
+            missing = [lb for lb in (LABEL_CROSS, LABEL_X) if lb not in loaded]
+            if missing:
+                error = "필터 누락: {}".format(", ".join(missing))
+
+        if error:
+            print("✗ {:<8} 필터 로드 실패 ({})".format(size_key, error))
+        else:
+            filters[n] = loaded
+            print("✓ {:<8} 필터 로드 완료 (Cross, X)".format(size_key))
+    return filters
+
+
+def analyze_pattern(case_id, case, filters):
+    """패턴 1개를 검증·판정하고 결과 딕셔너리를 반환한다. 예외를 밖으로 던지지 않는다.
+
+    반환: {'id', 'passed', 'reason', 'cross', 'x', 'result', 'expected'}
+    """
+    result = {"id": case_id, "passed": False, "reason": "",
+              "cross": None, "x": None, "result": None, "expected": None}
+
+    n = parse_size_key(case_id, with_index=True)
+    if n is None:
+        result["reason"] = "키 형식 오류 (size_N_idx 형태가 아님)"
+        return result
+    if not isinstance(case, dict):
+        result["reason"] = "패턴 항목 형식 오류"
+        return result
+
+    expected = normalize_label(case.get("expected"))
+    result["expected"] = expected
+    if expected is None:
+        result["reason"] = "알 수 없는 expected 값: {!r}".format(case.get("expected"))
+        return result
+
+    if n not in filters:
+        result["reason"] = "size_{} 필터가 없음".format(n)
+        return result
+
+    problem = validate_matrix(case.get("input"), n)
+    if problem:
+        result["reason"] = "패턴 크기/형식 불일치 - {}".format(problem)
+        return result
+
+    pattern = case["input"]
+    score_cross = mac(pattern, filters[n][LABEL_CROSS])
+    score_x = mac(pattern, filters[n][LABEL_X])
+    decision = judge(score_cross, score_x, LABEL_CROSS, LABEL_X)
+    result.update(cross=score_cross, x=score_x, result=decision)
+
+    if decision == LABEL_UNDECIDED:
+        result["reason"] = "동점(UNDECIDED) 처리 규칙에 따라 FAIL (|Cross-X| < {})".format(EPSILON_TEXT)
+    elif decision != expected:
+        result["reason"] = "판정 {}이(가) expected {}와(과) 다름".format(decision, expected)
+    else:
+        result["passed"] = True
+    return result
+
+
+def print_pattern_result(r):
+    print("--- {} ---".format(r["id"]))
+    if r["result"] is None:  # 연산 전에 검증 단계에서 실패
+        print("FAIL ({})".format(r["reason"]))
+        return
+    print("Cross 점수:", repr(r["cross"]))
+    print("X 점수:", repr(r["x"]))
+    status = "PASS" if r["passed"] else "FAIL"
+    if r["result"] == LABEL_UNDECIDED:
+        status += " (동점 규칙)"
+    print("판정: {} | expected: {} | {}".format(r["result"], r["expected"], status))
+
+
+def print_summary(results):
+    passed = [r for r in results if r["passed"]]
+    failed = [r for r in results if not r["passed"]]
+    print("총 테스트: {}개".format(len(results)))
+    print("통과: {}개".format(len(passed)))
+    print("실패: {}개".format(len(failed)))
+    if failed:
+        print("\n실패 케이스:")
+        for r in failed:
+            print("- {}: {}".format(r["id"], r["reason"]))
+
+
+def run_json_mode(path=DEFAULT_DATA_PATH):
+    data, error = load_json(path)
+    if error:
+        print(error)
+        return
+
+    print_section("[1] 필터 로드")
+    filters = load_filters(data)
+
+    print_section("[2] 패턴 분석 (라벨 정규화 적용)")
+    patterns = data.get("patterns") if isinstance(data, dict) else None
+    results = []
+    if not isinstance(patterns, dict):
+        print("patterns 항목이 없거나 형식이 잘못됨")
+    else:
+        for case_id, case in patterns.items():
+            r = analyze_pattern(case_id, case, filters)
+            print_pattern_result(r)
+            results.append(r)
+
+    print_section("[3] 성능 분석 (평균/{}회)".format(REPEAT))
+    print("(4단계에서 구현 예정)")
+
+    print_section("[4] 결과 요약")
+    print_summary(results)
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +430,9 @@ def main():
         if choice == "1":
             run_user_mode()
         else:
-            run_json_mode()
+            # 인자로 다른 JSON 경로를 주면 그 파일을 분석한다 (오류 테스트용)
+            path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATA_PATH
+            run_json_mode(path)
     except (KeyboardInterrupt, EOFError):
         print("\n입력이 중단되어 프로그램을 종료합니다.")
 
