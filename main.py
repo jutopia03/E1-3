@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 
 # ---------------------------------------------------------------------------
 # 상수
@@ -116,31 +117,139 @@ def judge(score_a, score_b, label_a, label_b):
 
 
 # ---------------------------------------------------------------------------
+# 보너스: 1차원 배열 버전 MAC (메모리 접근 단순화)
+# ---------------------------------------------------------------------------
+def flatten(matrix):
+    """n×n 2차원 배열을 길이 n²의 1차원 배열로 펼친다. (행 우선 순서)"""
+    flat = []
+    for row in matrix:
+        for value in row:
+            flat.append(value)
+    return flat
+
+
+def mac_flat(pattern_flat, filter_flat):
+    """1차원 배열끼리 MAC 연산. 인덱스 하나(k)로 접근한다.
+
+    2차원 버전은 pattern[i][j]마다 '행 찾기 → 열 찾기' 두 번 인덱싱하지만
+    1차원 버전은 pattern[k] 한 번만 인덱싱한다. 곱셈 횟수는 똑같이 n².
+    """
+    total = 0.0
+    for k in range(len(pattern_flat)):
+        total += pattern_flat[k] * filter_flat[k]
+    return total
+
+
+# ---------------------------------------------------------------------------
+# 보너스: 패턴 생성기
+# ---------------------------------------------------------------------------
+def generate_cross(n):
+    """가운데 행과 가운데 열이 1인 n×n 십자가 패턴을 만든다."""
+    m = create_matrix(n)
+    mid = n // 2
+    for i in range(n):
+        set_value(m, mid, i, 1.0)
+        set_value(m, i, mid, 1.0)
+    return m
+
+
+def generate_x(n):
+    """두 대각선이 1인 n×n X 패턴을 만든다."""
+    m = create_matrix(n)
+    for i in range(n):
+        set_value(m, i, i, 1.0)
+        set_value(m, i, n - 1 - i, 1.0)
+    return m
+
+
+GENERATORS = {LABEL_CROSS: generate_cross, LABEL_X: generate_x}
+
+
+# ---------------------------------------------------------------------------
 # 성능 측정
 # ---------------------------------------------------------------------------
 REPEAT = 10  # 크기별 반복 측정 횟수
+PERF_SIZES = [3, 5, 13, 25]
 
 
-def measure_mac_ms(pattern, filt, repeat=REPEAT):
-    """MAC 연산을 repeat번 실행한 평균 시간(ms)을 반환한다.
+def measure_ms(func, a, b, repeat=REPEAT):
+    """func(a, b)를 repeat번 실행한 평균 시간(ms)을 반환한다.
 
     I/O를 빼고 연산 함수 호출 구간만 잰다. 한 번 실행은 너무 짧아
     타이머 오차가 크므로, repeat번 전체를 한 번에 잰 뒤 횟수로 나눈다.
+    측정 전에 한 번 미리 실행(워밍업)해 첫 호출에만 드는 비용을 뺀다.
     """
+    func(a, b)  # 워밍업
     start = time.perf_counter()
     for _ in range(repeat):
-        mac(pattern, filt)
+        func(a, b)
     elapsed = time.perf_counter() - start
     return elapsed / repeat * 1000
 
 
+def measure_mac_ms(pattern, filt, repeat=REPEAT):
+    """2차원 MAC 연산의 평균 시간(ms)."""
+    return measure_ms(mac, pattern, filt, repeat)
+
+
+def text_width(text):
+    """콘솔에 표시되는 폭. 한글 등 전각 문자는 2칸으로 센다."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def pad(text, width, align="left"):
+    """전각 문자 폭을 고려해 text를 width칸에 맞춘다."""
+    space = " " * max(0, width - text_width(text))
+    return text + space if align == "left" else space + text
+
+
+def print_table(headers, rows, widths):
+    """첫 열은 왼쪽, 나머지 열은 오른쪽 정렬로 표를 출력한다."""
+    def line(cells):
+        out = []
+        for i, cell in enumerate(cells):
+            out.append(pad(str(cell), widths[i], "left" if i == 0 else "right"))
+        return "".join(out)
+    print(line(headers))
+    print("-" * sum(widths))
+    for row in rows:
+        print(line(row))
+
+
 def print_performance_table(rows):
     """rows: [(n, 평균 ms), ...] 를 크기 / 평균 시간 / 연산 횟수(N²) 표로 출력한다."""
-    print("{:<10}{:>16}{:>12}".format("크기", "평균 시간(ms)", "연산 횟수"))
-    print("-" * 40)
-    for n, avg_ms in rows:
-        size = "{}×{}".format(n, n)
-        print("{:<10}{:>16.4f}{:>12}".format(size, avg_ms, n * n))
+    print_table(
+        ["크기", "평균 시간(ms)", "연산 횟수(N²)"],
+        [("{}×{}".format(n, n), "{:.4f}".format(ms), n * n) for n, ms in rows],
+        [10, 16, 16],
+    )
+
+
+def run_performance_analysis(sizes=PERF_SIZES):
+    """크기별로 생성한 Cross 패턴 × Cross 필터의 MAC 시간을 측정해 표로 출력한다.
+
+    모든 크기에서 같은 방식으로 만든 입력을 써서 '크기'만 달라지게 한다.
+    반환: [(n, 2D 평균 ms, 1D 평균 ms), ...]
+    """
+    results = []
+    for n in sizes:
+        pattern = generate_cross(n)
+        filt = generate_cross(n)
+        ms_2d = measure_mac_ms(pattern, filt)
+        ms_1d = measure_ms(mac_flat, flatten(pattern), flatten(filt))
+        results.append((n, ms_2d, ms_1d))
+    print_performance_table([(n, ms_2d) for n, ms_2d, _ in results])
+    return results
+
+
+def print_flat_comparison(results):
+    """보너스: 2D vs 1D 성능 비교 표 (동일 입력, 동일 반복 횟수)."""
+    rows = []
+    for n, ms_2d, ms_1d in results:
+        ratio = ms_2d / ms_1d if ms_1d > 0 else float("nan")
+        rows.append(("{}×{}".format(n, n), "{:.4f}".format(ms_2d), "{:.4f}".format(ms_1d), "{:.2f}x".format(ratio)))
+    print_table(["크기", "2D(ms)", "1D(ms)", "2D/1D"], rows, [10, 12, 12, 10])
+    print("(2D/1D > 1 이면 1차원 버전이 더 빠름)")
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +289,18 @@ def parse_row(line, n):
 
 def read_matrix(name, n=3):
     """n줄을 한 줄씩 입력받아 n×n 배열을 만든다. 잘못된 줄은 그 줄만 다시 입력받는다."""
-    print("{} ({}줄 입력, 공백 구분)".format(name, n))
+    print("{} ({}줄 입력, 공백 구분 / 1행에 cross 또는 x 입력 시 자동 생성)".format(name, n))
     matrix = create_matrix(n)
     r = 0
     while r < n:
         line = input("  {}행> ".format(r + 1))
+        if r == 0:
+            label = normalize_label(line)
+            if label in GENERATORS:
+                matrix = GENERATORS[label](n)
+                print("  -> {} 패턴 자동 생성".format(label))
+                print_matrix(matrix)
+                return matrix
         row, error = parse_row(line, n)
         if error:
             print("  " + error)
@@ -402,10 +518,47 @@ def run_json_mode(path=DEFAULT_DATA_PATH):
             results.append(r)
 
     print_section("[3] 성능 분석 (평균/{}회)".format(REPEAT))
-    print("(4단계에서 구현 예정)")
+    perf = run_performance_analysis()
+
+    print_section("[3-1] 보너스: 2D vs 1D 배열 MAC 비교 (평균/{}회)".format(REPEAT))
+    print_flat_comparison(perf)
 
     print_section("[4] 결과 요약")
     print_summary(results)
+
+
+# ---------------------------------------------------------------------------
+# 모드 3 (보너스): 패턴 생성기
+# ---------------------------------------------------------------------------
+def read_size():
+    while True:
+        text = input("크기 N 입력 (2 이상 정수, 홀수 권장): ").strip()
+        if text.isdigit() and int(text) >= 2:
+            return int(text)
+        print("입력 형식 오류: 2 이상의 정수를 입력하세요.")
+
+
+def run_generator_mode():
+    n = read_size()
+    if n % 2 == 0:
+        print("참고: 짝수 크기는 정중앙 칸이 없어 십자가가 한쪽으로 치우칩니다.")
+    cross, x = generate_cross(n), generate_x(n)
+
+    print_section("[1] 생성된 패턴 ({}×{})".format(n, n))
+    print("Cross:")
+    print_matrix(cross)
+    print("X:")
+    print_matrix(x)
+
+    print_section("[2] 생성 패턴으로 MAC 판정 (필터도 생성기로 만듦)")
+    for label, pattern in ((LABEL_CROSS, cross), (LABEL_X, x)):
+        s_cross = mac(pattern, cross)
+        s_x = mac(pattern, x)
+        print("{} 패턴 -> Cross 점수: {} / X 점수: {} / 판정: {}".format(
+            label, s_cross, s_x, judge(s_cross, s_x, LABEL_CROSS, LABEL_X)))
+
+    print_section("[3] 성능 분석 (평균/{}회)".format(REPEAT))
+    print_performance_table([(n, measure_mac_ms(cross, cross))])
 
 
 # ---------------------------------------------------------------------------
@@ -417,10 +570,11 @@ def select_mode():
         print("\n[모드 선택]")
         print("1. 사용자 입력 (3x3)")
         print("2. data.json 분석")
+        print("3. 패턴 생성기 (보너스)")
         choice = input("선택: ").strip()
-        if choice in ("1", "2"):
+        if choice in ("1", "2", "3"):
             return choice
-        print("1 또는 2를 입력하세요.")
+        print("1, 2, 3 중 하나를 입력하세요.")
 
 
 def main():
@@ -429,6 +583,8 @@ def main():
         choice = select_mode()
         if choice == "1":
             run_user_mode()
+        elif choice == "3":
+            run_generator_mode()
         else:
             # 인자로 다른 JSON 경로를 주면 그 파일을 분석한다 (오류 테스트용)
             path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATA_PATH
